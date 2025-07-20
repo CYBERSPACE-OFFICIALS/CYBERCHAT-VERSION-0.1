@@ -1,0 +1,82 @@
+// ==================== BACKEND: server/index.js ==================== const express = require('express'); const http = require('http'); const cors = require('cors'); const mongoose = require('mongoose'); const multer = require('multer'); const jwt = require('jsonwebtoken'); const bcrypt = require('bcryptjs'); const { Server } = require('socket.io'); const { v4: uuid } = require('uuid');
+
+const app = express(); const server = http.createServer(app); const io = new Server(server, { cors: { origin: '*' } });
+
+app.use(cors()); app.use(express.json()); app.use('/uploads', express.static('uploads'));
+
+mongoose.connect(process.env.MONGODB_URI);
+
+const User = mongoose.model('User', new mongoose.Schema({ username: String, password: String, }));
+
+const upload = multer({ dest: 'uploads/' });
+
+app.post('/register', async (req, res) => { const { username, password } = req.body; const hash = await bcrypt.hash(password, 10); await User.create({ username, password: hash }); res.send({ status: 'ok' }); });
+
+app.post('/login', async (req, res) => { const { username, password } = req.body; const user = await User.findOne({ username }); if (!user) return res.status(400).send('User not found'); const isValid = await bcrypt.compare(password, user.password); if (!isValid) return res.status(401).send('Invalid'); const token = jwt.sign({ username }, process.env.JWT_SECRET); res.send({ token }); });
+
+app.post('/upload', upload.single('image'), (req, res) => { res.send({ url: /uploads/${req.file.filename} }); });
+
+let messages = {};
+
+io.on('connection', (socket) => { socket.on('joinRoom', (room) => { socket.join(room); if (!messages[room]) messages[room] = []; socket.emit('loadMessages', messages[room]); });
+
+socket.on('chatMessage', ({ id, room, user, message, type }) => { const msg = { id, user, message, type, reactions: {} }; messages[room].push(msg); io.to(room).emit('chatMessage', msg); });
+
+socket.on('reactMessage', ({ messageId, emoji, user, room }) => { const msg = messages[room]?.find(m => m.id === messageId); if (!msg.reactions[emoji]) msg.reactions[emoji] = []; if (!msg.reactions[emoji].includes(user)) msg.reactions[emoji].push(user); io.to(room).emit('updateReactions', { messageId, reactions: msg.reactions }); });
+
+socket.on('deleteMessage', ({ messageId, room }) => { messages[room] = messages[room].filter(msg => msg.id !== messageId); io.to(room).emit('deleteMessage', { messageId }); });
+
+socket.on('editMessage', ({ messageId, newText, room }) => { const msg = messages[room]?.find(m => m.id === messageId); if (msg) msg.message = newText; io.to(room).emit('editMessage', { messageId, newText }); }); });
+
+server.listen(5000, () => console.log('Backend running on http://localhost:5000'));
+
+// ==================== FRONTEND: client/src/App.jsx ==================== import React from 'react'; import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'; import Auth from './components/Auth'; import ChatRoom from './components/ChatRoom';
+
+export default function App() { return ( <Router> <Routes> <Route path="/" element={<Auth />} /> <Route path="/chat" element={<ChatRoom />} /> </Routes> </Router> ); }
+
+// ==================== FRONTEND: client/src/components/Auth.jsx ==================== import React, { useState } from 'react'; import axios from 'axios'; import { useNavigate } from 'react-router-dom';
+
+export default function Auth() { const [username, setUsername] = useState(''); const [password, setPassword] = useState(''); const navigate = useNavigate();
+
+const login = async () => { const res = await axios.post('http://localhost:5000/login', { username, password }); localStorage.setItem('token', res.data.token); localStorage.setItem('username', username); navigate('/chat'); };
+
+const register = async () => { await axios.post('http://localhost:5000/register', { username, password }); login(); };
+
+return ( <div className="p-4 flex flex-col gap-2 w-80 mx-auto mt-32"> <input placeholder="Username" onChange={(e) => setUsername(e.target.value)} className="p-2 border" /> <input type="password" placeholder="Password" onChange={(e) => setPassword(e.target.value)} className="p-2 border" /> <button onClick={login} className="bg-green-500 text-white p-2">Login</button> <button onClick={register} className="bg-blue-500 text-white p-2">Register</button> </div> ); }
+
+// ==================== FRONTEND: client/src/components/GiphySearch.jsx ==================== import React, { useState } from 'react'; import axios from 'axios';
+
+export default function GiphySearch({ onSelect }) { const [query, setQuery] = useState(''); const [results, setResults] = useState([]);
+
+const searchGifs = async () => { const { data } = await axios.get(https://api.giphy.com/v1/gifs/search, { params: { api_key: 'YOUR_GIPHY_API_KEY', q: query, limit: 10, }, }); setResults(data.data); };
+
+return ( <div className="bg-white p-2 border mt-2"> <input className="border p-1" onChange={(e) => setQuery(e.target.value)} placeholder="Search GIFs" /> <button onClick={searchGifs} className="ml-2 p-1 bg-blue-500 text-white">Search</button> <div className="grid grid-cols-5 gap-2 mt-2"> {results.map(gif => ( <img key={gif.id} src={gif.images.fixed_height_small.url} onClick={() => onSelect(gif.images.original.url)} className="cursor-pointer" /> ))} </div> </div> ); }
+
+// ==================== FRONTEND: client/src/components/ChatRoom.jsx ==================== import React, { useEffect, useState } from 'react'; import io from 'socket.io-client'; import Picker from '@emoji-mart/react'; import data from '@emoji-mart/data'; import GiphySearch from './GiphySearch'; import { v4 as uuid } from 'uuid'; import axios from 'axios';
+
+const socket = io('http://localhost:5000');
+
+export default function ChatRoom() { const username = localStorage.getItem('username'); const [message, setMessage] = useState(''); const [chat, setChat] = useState([]); const [showEmoji, setShowEmoji] = useState(false); const [image, setImage] = useState(null); const [room, setRoom] = useState('general');
+
+useEffect(() => { socket.emit('joinRoom', room); socket.on('loadMessages', (msgs) => setChat(msgs)); socket.on('chatMessage', (msg) => setChat(prev => [...prev, msg])); socket.on('deleteMessage', ({ messageId }) => setChat(prev => prev.filter(m => m.id !== messageId))); socket.on('editMessage', ({ messageId, newText }) => setChat(prev => prev.map(m => m.id === messageId ? { ...m, message: newText } : m))); socket.on('updateReactions', ({ messageId, reactions }) => setChat(prev => prev.map(m => m.id === messageId ? { ...m, reactions } : m))); }, [room]);
+
+const sendMessage = async () => { const id = uuid(); if (image) { const form = new FormData(); form.append('image', image); const res = await axios.post('http://localhost:5000/upload', form); socket.emit('chatMessage', { id, user: username, room, message: res.data.url, type: 'image' }); setImage(null); } else if (message) { socket.emit('chatMessage', { id, user: username, room, message, type: 'text' }); } setMessage(''); };
+
+const deleteMsg = (id) => socket.emit('deleteMessage', { messageId: id, room }); const editMsg = (id) => { const newText = prompt('Edit your message:'); if (newText) socket.emit('editMessage', { messageId: id, newText, room }); }; const reactMsg = (id, emoji) => socket.emit('reactMessage', { messageId: id, emoji, user: username, room });
+
+return ( <div className="p-4"> <div className="mb-2"> Room: <input value={room} onChange={(e) => setRoom(e.target.value)} className="border p-1" /> </div> <div className="h-[300px] overflow-y-auto bg-gray-100 p-2 rounded"> {chat.map(msg => ( <div key={msg.id} className="mb-1"> <strong>{msg.user}</strong>: {msg.type === 'image' ? <img src={msg.message} className="w-32" /> : msg.message} {msg.user === username && ( <> <button onClick={() => deleteMsg(msg.id)}>🗑️</button> <button onClick={() => editMsg(msg.id)}>✏️</button> </> )} <div> <button onClick={() => reactMsg(msg.id, '❤️')}>❤️</button> <button onClick={() => reactMsg(msg.id, '😂')}>😂</button> {msg.reactions && Object.entries(msg.reactions).map(([emoji, users]) => ( <span key={emoji}>{emoji} {users.length}</span> ))} </div> </div> ))} </div>
+
+<input type="file" onChange={(e) => setImage(e.target.files[0])} />
+  <div className="flex gap-2 mt-2">
+    <input className="flex-1 border p-2" value={message} onChange={(e) => setMessage(e.target.value)} />
+    <button onClick={() => setShowEmoji(!showEmoji)}>😊</button>
+    <button onClick={sendMessage}>Send</button>
+  </div>
+  {showEmoji && (
+    <Picker data={data} onEmojiSelect={(e) => setMessage(message + e.native)} />
+  )}
+  <GiphySearch onSelect={(url) => socket.emit('chatMessage', { id: uuid(), user: username, room, message: url, type: 'gif' })} />
+</div>
+
+); }
+
